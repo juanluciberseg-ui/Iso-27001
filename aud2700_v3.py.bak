@@ -1,0 +1,1904 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+  AUDITORIA ISO/IEC 27001:2022 - RECOPILACION Y GENERACION DE EVIDENCIAS
+  Script multiplataforma para Kali Linux y Windows
+================================================================================
+  Recopila logs, genera informes estructurados conforme a ISO 27001,
+  permite analisis con IA y exportacion a PDF.
+
+  Uso:
+    Linux (Kali):   sudo python3 iso27001_auditor.py
+    Windows:        python iso27001_auditor.py  (como Administrador)
+"""
+
+import os
+import sys
+import platform
+import subprocess
+import shutil
+import json
+import datetime
+import signal
+import getpass
+import re
+import hashlib
+from pathlib import Path
+
+# =============================================================================
+# CONFIGURACION GLOBAL
+# =============================================================================
+SCRIPT_VERSION = "3.1"
+CTRL_Z_MSG = "\n[+] Volviendo al menu principal..."
+
+SUDO_CACHED = False
+IS_ADMIN = False
+REPORT_COUNTER = 0
+
+# --- Estado de auditoria REMOTA (SSH para Linux, WinRM para Windows) ---
+REMOTE_MODE = False
+REMOTE_OS = None          # "linux" | "windows"
+REMOTE_HOST = ""
+REMOTE_PORT = None
+REMOTE_USER = ""
+REMOTE_PASS = ""          # solo en memoria durante la sesion, nunca se escribe a disco
+SSH_CLIENT = None
+WINRM_SESSION = None
+WINRM_TRANSPORT = "ntlm"  # usar "basic" si el objetivo tiene WinRM con HTTPS/basic auth
+
+audit_data = {
+    "organizacion": "", "alcance": "", "auditor": "", "fecha_auditoria": "",
+    "ip_objetivo": "", "dominio": "", "contacto": "", "ubicacion": "",
+    "norma": "ISO/IEC 27001:2022", "hostname": "", "sistema_operativo": "",
+    "output_dir": "", "id_auditoria": ""
+}
+
+
+class C:
+    H = '\033[95m' if os.name != 'nt' else ''
+    B = '\033[94m' if os.name != 'nt' else ''
+    C = '\033[96m' if os.name != 'nt' else ''
+    G = '\033[92m' if os.name != 'nt' else ''
+    W = '\033[93m' if os.name != 'nt' else ''
+    F = '\033[91m' if os.name != 'nt' else ''
+    E = '\033[0m' if os.name != 'nt' else ''
+    BD = '\033[1m' if os.name != 'nt' else ''
+
+
+def color(t, c):
+    return f"{c}{t}{C.E}"
+
+
+def _import_paramiko():
+    try:
+        import paramiko
+        return paramiko
+    except ImportError:
+        print(color("  [!] Falta el modulo 'paramiko' para SSH remoto.", C.F))
+        print(color("      Instalelo con: pip install paramiko --break-system-packages", C.W))
+        return None
+
+
+def _import_winrm():
+    try:
+        import winrm
+        return winrm
+    except ImportError:
+        print(color("  [!] Falta el modulo 'pywinrm' para WinRM remoto.", C.F))
+        print(color("      Instalelo con: pip install pywinrm --break-system-packages", C.W))
+        return None
+
+
+def sig_handler(signum, frame):
+    print(CTRL_Z_MSG)
+    raise KeyboardInterrupt("SIGTSTP")
+
+
+if hasattr(signal, 'SIGTSTP'):
+    signal.signal(signal.SIGTSTP, sig_handler)
+if hasattr(signal, 'SIGINT'):
+    signal.signal(signal.SIGINT, sig_handler)
+
+
+def clear():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+
+def banner():
+    print(f"""
+{C.C}╔══════════════════════════════════════════════════════════════════════════════╗
+║         ISO/IEC 27001:2022 - RECOPILACION DE EVIDENCIAS DE AUDITORIA       ║
+║                    Version {SCRIPT_VERSION} | Multiplataforma | Ctrl+Z = Menu            ║
+╚══════════════════════════════════════════════════════════════════════════════╝{C.E}
+""")
+
+
+def safe_input(prompt, default=""):
+    try:
+        r = input(prompt)
+        return r.strip() if r.strip() else default
+    except (EOFError, KeyboardInterrupt):
+        print(CTRL_Z_MSG)
+        raise
+
+
+def run_cmd(cmd, shell=True, capture=True, timeout=120, use_sudo=False):
+    global SUDO_CACHED
+    if REMOTE_MODE:
+        return run_cmd_remote(cmd, timeout=timeout, use_sudo=use_sudo)
+    if use_sudo and SUDO_CACHED and not IS_ADMIN and os.name != 'nt':
+        cmd = f"sudo {cmd}"
+    try:
+        if capture:
+            r = subprocess.run(cmd, shell=shell, capture_output=True, text=True,
+                             timeout=timeout, encoding='utf-8', errors='ignore')
+            return r.returncode, r.stdout, r.stderr
+        else:
+            r = subprocess.run(cmd, shell=shell, timeout=timeout)
+            return r.returncode, "", ""
+    except subprocess.TimeoutExpired:
+        return -1, "", "Timeout"
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def run_cmd_remote(cmd, timeout=120, use_sudo=False):
+    """Despacha la ejecucion de un comando hacia el equipo objetivo remoto."""
+    if REMOTE_OS == "linux":
+        rc, out, err = _run_cmd_ssh(cmd, timeout=timeout, use_sudo=use_sudo)
+    elif REMOTE_OS == "windows":
+        rc, out, err = _run_cmd_winrm(cmd, timeout=timeout)
+    else:
+        return -1, "", "Modo remoto activo pero sin SO objetivo configurado"
+    if rc != 0:
+        detalle = (err or out or "").strip().replace("\n", " ")[:200]
+        print(color(f"    [!] Fallo remoto (rc={rc}): {cmd[:70]}", C.W))
+        if detalle:
+            print(color(f"        -> {detalle}", C.W))
+    return rc, out, err
+
+
+def _ssh_alive():
+    if SSH_CLIENT is None:
+        return False
+    transport = SSH_CLIENT.get_transport()
+    return transport is not None and transport.is_active()
+
+
+def _reconnect_ssh_silent():
+    """Reconecta por SSH usando las credenciales ya guardadas en memoria, sin volver
+    a pedirle nada al usuario. Se usa cuando la sesion se cae a mitad de auditoria."""
+    global SSH_CLIENT
+    if not REMOTE_HOST or not REMOTE_USER:
+        return False
+    paramiko = _import_paramiko()
+    if not paramiko:
+        return False
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(REMOTE_HOST, port=REMOTE_PORT, username=REMOTE_USER,
+                        password=REMOTE_PASS, timeout=15, banner_timeout=15, auth_timeout=15)
+        SSH_CLIENT = client
+        print(color(f"    [i] Sesion SSH perdida. Reconectado automaticamente a {REMOTE_HOST}.", C.C))
+        return True
+    except Exception as e:
+        print(color(f"    [!] Reconexion SSH automatica fallo: {e}", C.F))
+        return False
+
+
+def _run_cmd_ssh(cmd, timeout=120, use_sudo=False):
+    if not _ssh_alive():
+        if not _reconnect_ssh_silent():
+            return -1, "", "No hay conexion SSH activa con el objetivo (reconexion fallida)"
+    try:
+        return _exec_ssh_once(cmd, timeout=timeout, use_sudo=use_sudo)
+    except Exception as e:
+        # La sesion pudo caerse justo durante este comando: reconectar y reintentar UNA vez,
+        # reutilizando las credenciales ya guardadas (sin volver a preguntar al usuario).
+        if _reconnect_ssh_silent():
+            try:
+                return _exec_ssh_once(cmd, timeout=timeout, use_sudo=use_sudo)
+            except Exception as e2:
+                return -1, "", str(e2)
+        return -1, "", str(e)
+
+
+def _exec_ssh_once(cmd, timeout=120, use_sudo=False):
+    if use_sudo:
+        safe_cmd = cmd.replace("'", "'\\''")
+        remote_cmd = f"sudo -S -p '' bash -c '{safe_cmd}'"
+    else:
+        remote_cmd = cmd
+    stdin, stdout, stderr = SSH_CLIENT.exec_command(remote_cmd, timeout=timeout, get_pty=use_sudo)
+    if use_sudo:
+        stdin.write(REMOTE_PASS + "\n")
+        stdin.flush()
+    out = stdout.read().decode(errors="ignore")
+    err = stderr.read().decode(errors="ignore")
+    rc = stdout.channel.recv_exit_status()
+    return rc, out, err
+
+
+def _reconnect_winrm_silent():
+    """Recrea la sesion WinRM usando las credenciales ya guardadas en memoria."""
+    global WINRM_SESSION
+    if not REMOTE_HOST or not REMOTE_USER:
+        return False
+    winrm = _import_winrm()
+    if not winrm:
+        return False
+    try:
+        endpoint = f"http://{REMOTE_HOST}:{REMOTE_PORT}/wsman"
+        WINRM_SESSION = winrm.Session(endpoint, auth=(REMOTE_USER, REMOTE_PASS), transport=WINRM_TRANSPORT)
+        print(color(f"    [i] Sesion WinRM renovada automaticamente con {REMOTE_HOST}.", C.C))
+        return True
+    except Exception as e:
+        print(color(f"    [!] Renovacion WinRM automatica fallo: {e}", C.F))
+        return False
+
+
+def _run_cmd_winrm(cmd, timeout=120):
+    if WINRM_SESSION is None:
+        if not _reconnect_winrm_silent():
+            return -1, "", "No hay sesion WinRM activa con el objetivo (reconexion fallida)"
+    try:
+        return _exec_winrm_once(cmd)
+    except Exception as e:
+        if _reconnect_winrm_silent():
+            try:
+                return _exec_winrm_once(cmd)
+            except Exception as e2:
+                return -1, "", str(e2)
+        return -1, "", str(e)
+
+
+def _exec_winrm_once(cmd):
+    # Las funciones win_* ya construyen comandos como: powershell -Command "..."
+    m = re.match(r'^powershell(?:\.exe)?\s+-Command\s+"(.*)"\s*$', cmd, re.DOTALL)
+    if m:
+        ps_script = m.group(1)
+    else:
+        # Comandos "planos" (tasklist, netstat, secedit, etc.) se envuelven
+        # en cmd /c dentro de PowerShell para soportar operadores como &&
+        escaped = cmd.replace('"', '`"')
+        ps_script = f'cmd /c "{escaped}"'
+    r = WINRM_SESSION.run_ps(ps_script)
+    out = r.std_out.decode(errors="ignore")
+    err = r.std_err.decode(errors="ignore")
+    return r.status_code, out, err
+
+
+def check_tool(name):
+    if REMOTE_MODE:
+        return check_tool_remote(name)
+    return shutil.which(name) is not None
+
+
+def path_exists(path):
+    """Comprueba si una ruta existe: en el objetivo remoto si hay modo remoto activo,
+    o en el equipo local en caso contrario. Usar SIEMPRE esta funcion (no os.path.exists)
+    dentro de las funciones de recopilacion de evidencias."""
+    if REMOTE_MODE and REMOTE_OS == "linux":
+        ret, _, _ = run_cmd(f"test -e '{path}'", use_sudo=True)
+        return ret == 0
+    return os.path.exists(path)
+
+
+def check_tool_remote(name):
+    if REMOTE_OS == "linux":
+        ret, out, _ = run_cmd(f"command -v {name}")
+        return ret == 0 and out.strip() != ""
+    elif REMOTE_OS == "windows":
+        ret, out, _ = run_cmd(
+            f'powershell -Command "Get-Command {name} -ErrorAction SilentlyContinue '
+            f'| Select-Object -First 1 | Format-Table -HideTableHeaders"'
+        )
+        return ret == 0 and out.strip() != ""
+    return False
+
+
+def _prompt_remote_credentials():
+    """Pide desde cero SO/host/puerto/usuario/contrasena del objetivo remoto.
+    Devuelve (None, None, None, None, None) si el usuario cancela o falta un dato requerido."""
+    so = safe_input("  SO del objetivo [linux/windows]: ", "linux").lower()
+    so = "windows" if so.startswith("w") else "linux"
+    host = safe_input("  IP/host del objetivo: ", audit_data.get("ip_objetivo", ""))
+    if not host:
+        print(color("  [!] IP/host requerido.", C.F))
+        return None, None, None, None, None
+    default_port = "22" if so == "linux" else "5985"
+    port_str = safe_input(f"  Puerto [{default_port}]: ", default_port)
+    try:
+        port = int(port_str)
+    except ValueError:
+        port = int(default_port)
+    user = safe_input("  Usuario administrador del objetivo: ")
+    if not user:
+        print(color("  [!] Usuario requerido.", C.F))
+        return None, None, None, None, None
+    try:
+        passwd = getpass.getpass("  Contrasena (no se muestra ni se guarda en disco): ")
+    except (EOFError, KeyboardInterrupt):
+        print(CTRL_Z_MSG)
+        return None, None, None, None, None
+    return so, host, port, user, passwd
+
+
+def connect_remote_target():
+    """Configura y prueba la conexion contra un equipo objetivo remoto (SSH o WinRM)."""
+    global REMOTE_MODE, REMOTE_OS, REMOTE_HOST, REMOTE_PORT, REMOTE_USER, REMOTE_PASS
+    global SSH_CLIENT, WINRM_SESSION
+
+    print(color("\n--- CONFIGURACION DE OBJETIVO REMOTO ---", C.H))
+
+    # Si ya nos conectamos antes en esta misma sesion, ofrecer reutilizar esos datos
+    # (incluida la contrasena, ya guardada en memoria) en vez de volver a pedirlos.
+    if REMOTE_HOST and REMOTE_USER and REMOTE_OS:
+        print(color(f"  [i] Datos guardados de la conexion anterior: "
+                     f"{REMOTE_USER}@{REMOTE_HOST}:{REMOTE_PORT} ({REMOTE_OS})", C.C))
+        reutilizar = safe_input("  Reutilizar estos datos sin volver a pedirlos? [S/n]: ", "S").upper()
+        if reutilizar != "N":
+            so_local, host, port, user, passwd = REMOTE_OS, REMOTE_HOST, REMOTE_PORT, REMOTE_USER, REMOTE_PASS
+        else:
+            so_local, host, port, user, passwd = _prompt_remote_credentials()
+            if so_local is None:
+                return False
+    else:
+        so_local, host, port, user, passwd = _prompt_remote_credentials()
+        if so_local is None:
+            return False
+
+    REMOTE_OS = so_local
+    print(color("  [*] Probando conexion...", C.C))
+
+    if REMOTE_OS == "linux":
+        paramiko = _import_paramiko()
+        if not paramiko:
+            return False
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(host, port=port, username=user, password=passwd,
+                            timeout=15, banner_timeout=15, auth_timeout=15)
+            _, stdout, _ = client.exec_command("echo OK", timeout=10)
+            result = stdout.read().decode(errors="ignore").strip()
+            if result != "OK":
+                print(color("  [!] Conexion establecida pero respuesta inesperada del host.", C.F))
+                client.close()
+                return False
+        except Exception as e:
+            print(color(f"  [!] Error de conexion SSH: {e}", C.F))
+            return False
+        SSH_CLIENT = client
+    else:
+        winrm = _import_winrm()
+        if not winrm:
+            return False
+        try:
+            endpoint = f"http://{host}:{port}/wsman"
+            session = winrm.Session(endpoint, auth=(user, passwd), transport=WINRM_TRANSPORT)
+            r = session.run_cmd("hostname")
+            if r.status_code != 0:
+                print(color(f"  [!] WinRM respondio con error: {r.std_err.decode(errors='ignore')}", C.F))
+                return False
+            print(color(f"      Hostname remoto: {r.std_out.decode(errors='ignore').strip()}", C.C))
+
+            # Deteccion de UAC remoto (LocalAccountTokenFilterPolicy): si el usuario es un
+            # admin local (no la cuenta "Administrator" incorporada), Windows suele entregarle
+            # un token SIN elevar en conexiones de red, y las pruebas que requieren privilegios
+            # (logs Security, secedit, grupos, etc.) fallaran en silencio.
+            r2 = session.run_cmd("net session")
+            if r2.status_code != 0:
+                print(color("\n  [!] AVISO IMPORTANTE: token administrativo NO elevado en la sesion remota.", C.W))
+                print(color("      Esto es tipico de UAC remoto (LocalAccountTokenFilterPolicy=0) al usar", C.W))
+                print(color("      una cuenta local de administrador que NO es la cuenta 'Administrator'", C.W))
+                print(color("      integrada. Muchas pruebas (Security log, secedit, grupos...) fallaran", C.W))
+                print(color("      con 'Access is denied' aunque la conexion funcione.", C.W))
+                print(color("      Solucion en el OBJETIVO (PowerShell como Administrador):", C.W))
+                print(color('      New-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\'
+                             'Policies\\System" -Name LocalAccountTokenFilterPolicy -PropertyType DWord '
+                             '-Value 1 -Force', C.C))
+                print(color("      Alternativa: conectar con la cuenta 'Administrator' incorporada.\n", C.W))
+                cont = safe_input("      Continuar de todas formas? [s/N]: ", "N").upper()
+                if cont != "S":
+                    return False
+        except Exception as e:
+            print(color(f"  [!] Error de conexion WinRM: {e}", C.F))
+            print(color("      Verifique que WinRM este habilitado en el objetivo:", C.W))
+            print(color("      (ejecutar en el Windows Server objetivo) winrm quickconfig -q", C.W))
+            return False
+        WINRM_SESSION = session
+
+    REMOTE_MODE = True
+    REMOTE_HOST, REMOTE_PORT, REMOTE_USER, REMOTE_PASS = host, port, user, passwd
+    audit_data["ip_objetivo"] = host
+    audit_data["modo_auditoria"] = f"REMOTO-{REMOTE_OS.upper()}"
+    print(color(f"  [+] Conexion establecida con {host}:{port} ({REMOTE_OS}).", C.G))
+    return True
+
+
+def disconnect_remote_target():
+    global REMOTE_MODE, SSH_CLIENT, WINRM_SESSION
+    if SSH_CLIENT is not None:
+        try:
+            SSH_CLIENT.close()
+        except Exception:
+            pass
+    SSH_CLIENT = None
+    WINRM_SESSION = None
+    REMOTE_MODE = False
+
+
+def ensure_dir(p):
+    Path(p).mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def save_file(path, content, mode='w'):
+    try:
+        with open(path, mode, encoding='utf-8', errors='ignore') as f:
+            f.write(content)
+        return True
+    except Exception as e:
+        print(color(f"[!] Error guardando {path}: {e}", C.F))
+        return False
+
+
+def next_report_id(prefix):
+    global REPORT_COUNTER
+    REPORT_COUNTER += 1
+
+    # Validación anti-duplicado: buscar siguiente número libre
+    informes_dir = os.path.join(audit_data.get("output_dir", "."), "informes")
+    while True:
+        report_id = f"ISO27001-{prefix}-{REPORT_COUNTER:03d}"
+        json_path = os.path.join(informes_dir, f"{report_id}.json")
+        txt_path = os.path.join(informes_dir, f"{report_id}.txt")
+        if not os.path.exists(json_path) and not os.path.exists(txt_path):
+            break
+        REPORT_COUNTER += 1  # Saltar al siguiente si ya existe
+
+    return report_id
+
+
+def hash_file(filepath):
+    try:
+        h = hashlib.sha256()
+        with open(filepath, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return "N/A"
+
+
+def generate_iso_report(report_id, control_iso, titulo, descripcion,
+                        hallazgos, evidencias, datos_tecnicos,
+                        cumplimiento, severidad, recomendaciones,
+                        referencias=None):
+    if referencias is None:
+        referencias = ["ISO/IEC 27001:2022", "ISO/IEC 27002:2022"]
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    report = {
+        "id_informe": report_id, "fecha_hora": timestamp,
+        "organizacion": audit_data["organizacion"], "auditor": audit_data["auditor"],
+        "alcance": audit_data["alcance"], "ip_objetivo": audit_data["ip_objetivo"],
+        "dominio": audit_data["dominio"], "hostname": audit_data["hostname"],
+        "control_iso": control_iso, "titulo_prueba": titulo,
+        "descripcion": descripcion, "hallazgos": hallazgos,
+        "evidencia_recopilada": evidencias, "datos_tecnicos": datos_tecnicos,
+        "nivel_cumplimiento": cumplimiento, "severidad": severidad,
+        "recomendaciones": recomendaciones, "referencias": referencias,
+        "hash_integridad": "", "version_script": SCRIPT_VERSION
+    }
+    
+    json_path = os.path.join(audit_data["output_dir"], "informes", f"{report_id}.json")
+    ensure_dir(os.path.dirname(json_path))
+    save_file(json_path, json.dumps(report, indent=4, ensure_ascii=False))
+    report["hash_integridad"] = hash_file(json_path)
+    save_file(json_path, json.dumps(report, indent=4, ensure_ascii=False))
+    
+    nl = "\n"
+    txt = f"""
+{'='*80}
+INFORME DE AUDITORIA - ISO/IEC 27001:2022
+{'='*80}
+ID Informe:        {report_id}
+Fecha/Hora:        {timestamp}
+Organizacion:      {audit_data['organizacion']}
+Auditor:           {audit_data['auditor']}
+Alcance:           {audit_data['alcance']}
+IP Objetivo:       {audit_data['ip_objetivo']}
+Dominio:           {audit_data['dominio']}
+Hostname:          {audit_data['hostname']}
+Control ISO:       {control_iso}
+{'='*80}
+TITULO DE PRUEBA
+{'='*80}
+{titulo}
+
+DESCRIPCION
+{'='*80}
+{descripcion}
+
+HALLAZGOS
+{'='*80}
+{hallazgos}
+
+DATOS TECNICOS / EVIDENCIA BRUTA
+{'='*80}
+{datos_tecnicos[:50000] if datos_tecnicos else 'N/A'}
+
+EVIDENCIA RECOPILADA
+{'='*80}
+{nl.join(evidencias) if evidencias else 'N/A'}
+
+NIVEL DE CUMPLIMIENTO: {cumplimiento}
+SEVERIDAD:             {severidad}
+
+RECOMENDACIONES
+{'='*80}
+{recomendaciones}
+
+REFERENCIAS
+{'='*80}
+{nl.join(referencias)}
+
+HASH DE INTEGRIDAD (SHA-256): {report['hash_integridad']}
+Generado con: ISO27001 Auditor v{SCRIPT_VERSION}
+{'='*80}
+"""
+    txt_path = os.path.join(audit_data["output_dir"], "informes", f"{report_id}.txt")
+    save_file(txt_path, txt)
+    print(color(f"    [+] Informe: {report_id}", C.G))
+    return json_path, txt_path
+def check_privileges():
+    global SUDO_CACHED, IS_ADMIN
+    if os.name == 'nt':
+        try:
+            import ctypes
+            IS_ADMIN = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            pass
+        if not IS_ADMIN:
+            print(color("[!] ADVERTENCIA: No se detecto ejecucion como Administrador", C.W))
+            print(color("[!] Algunas evidencias no seran accesibles.\n", C.W))
+        else:
+            print(color("[+] Privilegios de Administrador confirmados", C.G))
+        return
+    if hasattr(os, 'geteuid') and os.geteuid() == 0:
+        IS_ADMIN = True
+        SUDO_CACHED = True
+        print(color("[+] Ejecutando como root", C.G))
+        return
+    print(color("[*] Verificando acceso sudo...", C.C))
+    ret, _, _ = run_cmd("sudo -n true", timeout=10)
+    if ret == 0:
+        SUDO_CACHED = True
+        print(color("[+] Cache sudo disponible", C.G))
+        return
+    print(color("[!] Se requieren privilegios elevados.", C.W))
+    try:
+        pwd = getpass.getpass("    Contrasena sudo: ")
+        proc = subprocess.run(["sudo", "-S", "-v"], input=pwd + "\n",
+                              capture_output=True, text=True, timeout=30)
+        if proc.returncode == 0:
+            SUDO_CACHED = True
+            print(color("[+] Privilegios sudo cacheados", C.G))
+        else:
+            print(color("[!] No se pudo autenticar con sudo.", C.F))
+    except (EOFError, KeyboardInterrupt):
+        print(CTRL_Z_MSG)
+        raise
+    except Exception as e:
+        print(color(f"[!] Error con sudo: {e}", C.F))
+
+
+LINUX_TOOLS = {
+    "journalctl": {"pkg": "systemd", "critico": True, "desc": "Logs systemd (A.12.4.1)", "ctrl": "A.12.4"},
+    "last": {"pkg": "util-linux", "critico": True, "desc": "Historial logins (A.9.4.2)", "ctrl": "A.9.4"},
+    "lastlog": {"pkg": "login", "critico": True, "desc": "Ultimo login (A.9.4.2)", "ctrl": "A.9.4"},
+    "dmesg": {"pkg": "util-linux", "critico": False, "desc": "Mensajes kernel (A.12.4.1)", "ctrl": "A.12.4"},
+    "ss": {"pkg": "iproute2", "critico": True, "desc": "Conexiones red (A.13.1.1)", "ctrl": "A.13.1"},
+    "netstat": {"pkg": "net-tools", "critico": False, "desc": "Estadisticas red (A.13.1.1)", "ctrl": "A.13.1"},
+    "lsof": {"pkg": "lsof", "critico": False, "desc": "Archivos abiertos (A.12.4.1)", "ctrl": "A.12.4"},
+    "ps": {"pkg": "procps", "critico": True, "desc": "Procesos (A.12.4.1)", "ctrl": "A.12.4"},
+    "dpkg": {"pkg": "dpkg", "critico": False, "desc": "Paquetes (A.8.1.1)", "ctrl": "A.8.1"},
+    "apt": {"pkg": "apt", "critico": False, "desc": "Gestor paquetes (A.8.1.1)", "ctrl": "A.8.1"},
+    "auditctl": {"pkg": "auditd", "critico": True, "desc": "Framework auditoria (A.12.4.1)", "ctrl": "A.12.4"},
+    "aureport": {"pkg": "auditd", "critico": True, "desc": "Reportes auditoria (A.12.4.1)", "ctrl": "A.12.4"},
+    "ausearch": {"pkg": "auditd", "critico": True, "desc": "Busqueda logs (A.12.4.1)", "ctrl": "A.12.4"},
+    "iptables": {"pkg": "iptables", "critico": True, "desc": "Firewall (A.13.1.1)", "ctrl": "A.13.1"},
+    "ufw": {"pkg": "ufw", "critico": False, "desc": "Firewall UFW (A.13.1.1)", "ctrl": "A.13.1"},
+    "systemctl": {"pkg": "systemd", "critico": True, "desc": "Servicios (A.12.4.1)", "ctrl": "A.12.4"},
+    "crontab": {"pkg": "cron", "critico": True, "desc": "Tareas programadas (A.12.4.1)", "ctrl": "A.12.4"},
+    "find": {"pkg": "findutils", "critico": True, "desc": "Busqueda archivos (A.8.1.2)", "ctrl": "A.8.1"},
+    "stat": {"pkg": "coreutils", "critico": False, "desc": "Metadatos (A.8.1.2)", "ctrl": "A.8.1"},
+    "getent": {"pkg": "libc-bin", "critico": False, "desc": "BD usuarios (A.9.2.1)", "ctrl": "A.9.2"},
+}
+
+WINDOWS_TOOLS = {
+    "wevtutil": {"cmd": "wevtutil", "critico": True, "desc": "Logs eventos (A.12.4.1)", "ctrl": "A.12.4"},
+    "powershell": {"cmd": "powershell", "critico": True, "desc": "PowerShell (A.12.4.1)", "ctrl": "A.12.4"},
+    "netsh": {"cmd": "netsh", "critico": True, "desc": "Red/firewall (A.13.1.1)", "ctrl": "A.13.1"},
+    "tasklist": {"cmd": "tasklist", "critico": True, "desc": "Tareas (A.12.4.1)", "ctrl": "A.12.4"},
+    "sc": {"cmd": "sc", "critico": True, "desc": "Servicios (A.12.4.1)", "ctrl": "A.12.4"},
+    "reg": {"cmd": "reg", "critico": False, "desc": "Registro (A.12.4.1)", "ctrl": "A.12.4"},
+    "systeminfo": {"cmd": "systeminfo", "critico": False, "desc": "Info sistema (A.8.1.1)", "ctrl": "A.8.1"},
+}
+
+
+def verify_tools_at_startup():
+    clear()
+    banner()
+    if REMOTE_MODE:
+        print(color(f"[*] VERIFICACION DE HERRAMIENTAS EN OBJETIVO REMOTO ({REMOTE_HOST})\n", C.H))
+        is_linux = (REMOTE_OS == "linux")
+    else:
+        print(color("[*] VERIFICACION INICIAL DE HERRAMIENTAS\n", C.H))
+        is_linux = platform.system() != "Windows"
+    tools = LINUX_TOOLS if is_linux else WINDOWS_TOOLS
+    missing = []
+    installed = []
+    for tool, info in tools.items():
+        check_name = tool if is_linux else info["cmd"]
+        if check_tool(check_name):
+            installed.append((tool, info))
+        else:
+            missing.append((tool, info))
+    total = len(tools)
+    print(color(f"  Disponibles: {len(installed)}/{total}", C.G))
+    print(color(f"  Faltantes:   {len(missing)}/{total}\n", C.W if missing else C.G))
+    if missing:
+        print(color("--- FALTANTES ---", C.F))
+        for tool, info in missing:
+            crit = "[CRITICO]" if info["critico"] else "[Opcional]"
+            print(color(f"  {crit} {tool:20} - {info['desc']}", C.F if info["critico"] else C.W))
+        print()
+        if is_linux:
+            try:
+                ans = safe_input("Instalar herramientas faltantes? [S/n]: ", "S").upper()
+                if ans == 'S':
+                    install_missing_linux(missing)
+            except (EOFError, KeyboardInterrupt):
+                print(CTRL_Z_MSG)
+                return
+        else:
+            print(color("[!] En Windows instale manualmente.", C.W))
+            safe_input("Presione ENTER...")
+    else:
+        print(color("[+] Todas las herramientas disponibles.", C.G))
+        safe_input("Presione ENTER...")
+
+
+def install_missing_linux(missing_list):
+    print(color("\n[*] Instalando...", C.C))
+    pkgs = set()
+    for tool, info in missing_list:
+        pkgs.add(info.get("pkg", tool))
+    pkg_str = " ".join(sorted(pkgs))
+    if check_tool("apt"):
+        cmd = f"apt-get update && apt-get install -y {pkg_str}"
+    elif check_tool("yum"):
+        cmd = f"yum install -y {pkg_str}"
+    elif check_tool("dnf"):
+        cmd = f"dnf install -y {pkg_str}"
+    elif check_tool("pacman"):
+        cmd = f"pacman -S --noconfirm {pkg_str}"
+    else:
+        print(color("[!] No se detecto gestor de paquetes.", C.F))
+        return
+    if REMOTE_MODE or SUDO_CACHED or IS_ADMIN:
+        ret, _, err = run_cmd(cmd, shell=True, capture=False, timeout=300, use_sudo=True)
+        if ret == 0:
+            print(color("[+] Instalacion completada.", C.G))
+        else:
+            print(color(f"[!] Error: {err[-300:]}", C.F))
+    else:
+        print(color("[!] Sin privilegios para instalar.", C.F))
+    safe_input("Presione ENTER...")
+
+
+def collect_audit_data():
+    global REPORT_COUNTER
+    REPORT_COUNTER = 0
+    clear()
+    banner()
+    print(color("[*] CONFIGURACION DE DATOS DE AUDITORIA\n", C.H))
+    try:
+        audit_data["organizacion"] = safe_input("  Organizacion: ")
+        audit_data["alcance"] = safe_input("  Alcance: ", "SGSI")
+        audit_data["auditor"] = safe_input("  Auditor: ")
+        audit_data["fecha_auditoria"] = datetime.datetime.now().strftime("%Y-%m-%d")
+
+        # Si habia una conexion remota de una auditoria previa en esta misma sesion, ciérrala.
+        if REMOTE_MODE:
+            disconnect_remote_target()
+
+        modo = safe_input("  Modo de auditoria [L]ocal / [R]emoto (SSH/WinRM) [L]: ", "L").upper()
+        if modo == "R":
+            conectado = connect_remote_target()
+            if not conectado:
+                print(color("[!] No se pudo conectar. Continuando en modo LOCAL.", C.W))
+                safe_input("Presione ENTER...")
+
+        if not REMOTE_MODE:
+            audit_data["ip_objetivo"] = safe_input("  IP(s) objetivo: ", "127.0.0.1")
+            audit_data["modo_auditoria"] = "LOCAL"
+        audit_data["dominio"] = safe_input("  Dominio(s): ", "N/A")
+        audit_data["contacto"] = safe_input("  Contacto: ", "N/A")
+        audit_data["ubicacion"] = safe_input("  Ubicacion: ", "N/A")
+        audit_data["norma"] = safe_input("  Norma [ISO/IEC 27001:2022]: ", "ISO/IEC 27001:2022")
+        if REMOTE_MODE:
+            # hostname/SO se obtienen mejor consultando al objetivo; se guarda un valor
+            # provisional aqui, y verify_tools_at_startup() vuelve a validarlo tras conectar.
+            audit_data["hostname"] = REMOTE_HOST
+            audit_data["sistema_operativo"] = f"Remoto ({REMOTE_OS})"
+        else:
+            audit_data["hostname"] = platform.node()
+            audit_data["sistema_operativo"] = f"{platform.system()} {platform.release()}"
+        default_dir = f"ISO27001_Audit_{audit_data['organizacion']}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        out = safe_input(f"  Directorio [{default_dir}]: ", default_dir)
+        audit_data["output_dir"] = os.path.abspath(out)
+        audit_data["id_auditoria"] = f"AUD-{audit_data['organizacion'][:3].upper()}-{datetime.datetime.now().strftime('%Y%m%d')}"
+        ensure_dir(audit_data["output_dir"])
+        ensure_dir(os.path.join(audit_data["output_dir"], "informes"))
+        ensure_dir(os.path.join(audit_data["output_dir"], "evidencias"))
+        ensure_dir(os.path.join(audit_data["output_dir"], "export"))
+        meta = os.path.join(audit_data["output_dir"], "00_METADATA.json")
+        save_file(meta, json.dumps(audit_data, indent=4, ensure_ascii=False))
+        print(color(f"\n[+] Directorio: {audit_data['output_dir']}", C.G))
+        print(color(f"[+] ID: {audit_data['id_auditoria']}", C.G))
+        safe_input("Presione ENTER...")
+        if REMOTE_MODE:
+            # Vuelve a comprobar herramientas, esta vez contra el objetivo remoto real.
+            verify_tools_at_startup()
+        return True
+    except (EOFError, KeyboardInterrupt):
+        raise
+    except Exception as e:
+        print(color(f"[!] Error: {e}", C.F))
+        return False
+
+
+def show_audit_info():
+    print(color("\n--- DATOS AUDITORIA ---", C.C))
+    for k, v in audit_data.items():
+        if v:
+            print(f"  {k:20}: {v}")
+    if REMOTE_MODE:
+        print(color(f"  {'conexion':20}: REMOTA -> {REMOTE_USER}@{REMOTE_HOST}:{REMOTE_PORT} ({REMOTE_OS})", C.W))
+    else:
+        print(color(f"  {'conexion':20}: LOCAL (este equipo)", C.C))
+    print()
+    # =============================================================================
+# LINUX TESTS
+# =============================================================================
+def linux_system_logs():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "01_sistema"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Logs sistema (A.12.4.1)...", C.C))
+    if check_tool("journalctl"):
+        ret, out, _ = run_cmd("journalctl --no-pager -n 5000", use_sudo=True, timeout=120)
+        if ret == 0:
+            fp = os.path.join(evid_dir, "journalctl.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- JOURNALCTL ---\n{out[:30000]}"
+            hallazgos.append("Logs systemd recopilados.")
+    if check_tool("dmesg"):
+        ret, out, _ = run_cmd("dmesg --level=err,warn,info", use_sudo=True)
+        if ret == 0:
+            fp = os.path.join(evid_dir, "dmesg.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- DMESG ---\n{out[:20000]}"
+            hallazgos.append("Mensajes kernel recopilados.")
+    for logf in ["/var/log/syslog", "/var/log/messages", "/var/log/kern.log"]:
+        if path_exists(logf):
+            ret, out, _ = run_cmd(f"tail -n 2000 {logf}", use_sudo=True)
+            if ret == 0:
+                fp = os.path.join(evid_dir, os.path.basename(logf) + ".txt")
+                save_file(fp, out)
+                ev_files.append(fp)
+                datos_tecnicos += f"\n--- {logf} ---\n{out[:20000]}"
+                hallazgos.append(f"{logf} recopilado.")
+    ret, out, _ = run_cmd("uptime && cat /proc/loadavg")
+    if ret == 0:
+        datos_tecnicos += f"\n--- UPTIME ---\n{out}"
+    cumpl = "Cumple" if len(ev_files) >= 2 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Media"
+    rec = ("Mantener retencion de logs. Verificar rotacion e integridad."
+           if cumpl == "Cumple"
+           else "Implementar centralizacion de logs (SIEM) y retencion minima 12 meses.")
+    return generate_iso_report(
+        next_report_id("SYS"), "A.12.4.1", "Registros de eventos del sistema",
+        "Verificacion de disponibilidad, integridad y retencion de registros de eventos.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.12.4.1", "ISO/IEC 27002:2022 8.15"]
+    )
+
+
+def linux_auth_logs():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "02_autenticacion"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Autenticacion (A.9.4)...", C.C))
+    for cmd, label, fname in [
+        ("last -a -n 500", "LAST", "last.txt"),
+        ("lastlog", "LASTLOG", "lastlog.txt"),
+        ("faillog -a", "FAILLOG", "faillog.txt")
+    ]:
+        if check_tool(cmd.split()[0]):
+            ret, out, _ = run_cmd(cmd, use_sudo=True)
+            if ret == 0:
+                fp = os.path.join(evid_dir, fname)
+                save_file(fp, out)
+                ev_files.append(fp)
+                datos_tecnicos += f"\n--- {label} ---\n{out[:15000]}"
+                hallazgos.append(f"{label} recopilado.")
+    for logf in ["/var/log/auth.log", "/var/log/secure"]:
+        if path_exists(logf):
+            ret, out, _ = run_cmd(f"tail -n 3000 {logf}", use_sudo=True)
+            if ret == 0:
+                fp = os.path.join(evid_dir, os.path.basename(logf) + ".txt")
+                save_file(fp, out)
+                ev_files.append(fp)
+                datos_tecnicos += f"\n--- {logf} ---\n{out[:30000]}"
+                hallazgos.append(f"{logf} recopilado.")
+    for logf, label in [("/var/log/wtmp", "wtmp"), ("/var/log/btmp", "btmp")]:
+        if path_exists(logf):
+            ret, out, _ = run_cmd(f"last -f {logf}", use_sudo=True)
+            if ret == 0:
+                fp = os.path.join(evid_dir, f"{label}.txt")
+                save_file(fp, out)
+                ev_files.append(fp)
+                datos_tecnicos += f"\n--- {label.upper()} ---\n{out[:15000]}"
+                hallazgos.append(f"{label} volcado.")
+    if path_exists("/etc/sudoers"):
+        ret, out, _ = run_cmd("cat /etc/sudoers", use_sudo=True)
+        if ret == 0:
+            fp = os.path.join(evid_dir, "sudoers.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- SUDOERS ---\n{out[:10000]}"
+            hallazgos.append("Sudoers recopilado.")
+    cumpl = "Cumple" if len(ev_files) >= 3 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Alta"
+    rec = ("Verificar timestamp, origen y resultado en logs. Implementar alertas ante fallos."
+           if cumpl == "Cumple"
+           else "Implementar registro detallado de autenticacion. Configurar bloqueo de cuenta.")
+    return generate_iso_report(
+        next_report_id("AUTH"), "A.9.4.2, A.9.4.3", "Gestion de acceso seguro",
+        "Revision de registros de autenticacion, autorizacion y gestion de accesos.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.9.4.2", "ISO/IEC 27002:2022 5.17"]
+    )
+
+
+def linux_user_info():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "03_usuarios"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Usuarios (A.9.2)...", C.C))
+    for fpath in ["/etc/passwd", "/etc/shadow", "/etc/group", "/etc/gshadow",
+                  "/etc/login.defs", "/etc/pam.conf"]:
+        if path_exists(fpath):
+            ret, out, _ = run_cmd(f"cat {fpath}", use_sudo=True)
+            if ret == 0:
+                fp = os.path.join(evid_dir, os.path.basename(fpath) + ".txt")
+                save_file(fp, out)
+                ev_files.append(fp)
+                datos_tecnicos += f"\n--- {fpath} ---\n{out[:10000]}"
+                hallazgos.append(f"{fpath} recopilado.")
+    ret, out, _ = run_cmd("awk -F: '$7 !~ /nologin|false/ {print $1\" \"$7}' /etc/passwd")
+    if ret == 0:
+        datos_tecnicos += f"\n--- USERS WITH SHELL ---\n{out}"
+        shell_users = [l for l in out.strip().split("\n") if l.strip()]
+        hallazgos.append(f"Usuarios con shell: {len(shell_users)}.")
+    ret, out, _ = run_cmd("awk -F: '$3 == 0 {print $1}' /etc/passwd")
+    if ret == 0:
+        datos_tecnicos += f"\n--- UID 0 ---\n{out}"
+        hallazgos.append(f"UID 0: {out.strip()}.")
+    if check_tool("getent"):
+        ret, out, _ = run_cmd("getent passwd")
+        if ret == 0:
+            fp = os.path.join(evid_dir, "getent.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- GETENT ---\n{out[:10000]}"
+    cumpl = "Cumple" if len(ev_files) >= 4 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Media"
+    rec = ("Mantener inventario de usuarios. Revisar cuentas inactivas."
+           if cumpl == "Cumple"
+           else "Implementar proceso formal de registro/baja. Revisar privilegios admin.")
+    return generate_iso_report(
+        next_report_id("USER"), "A.9.2.1, A.9.2.2", "Registro y gestion de usuarios",
+        "Verificacion de gestion de identidades, cuentas y privilegios.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.9.2.1", "ISO/IEC 27002:2022 5.15"]
+    )
+
+
+def linux_network():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "04_red"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Red (A.13.1)...", C.C))
+    for cmd, label in [("ip addr show", "IP ADDR"), ("ip route show", "IP ROUTE")]:
+        ret, out, _ = run_cmd(cmd)
+        if ret == 0:
+            datos_tecnicos += f"\n--- {label} ---\n{out}"
+            hallazgos.append(f"{label} recopilado.")
+    if check_tool("ss"):
+        ret, out, _ = run_cmd("ss -tulnp")
+        if ret == 0:
+            fp = os.path.join(evid_dir, "ss.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- SS ---\n{out[:20000]}"
+            hallazgos.append("Conexiones activas via ss.")
+    if check_tool("netstat"):
+        ret, out, _ = run_cmd("netstat -tulnp")
+        if ret == 0:
+            fp = os.path.join(evid_dir, "netstat.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- NETSTAT ---\n{out[:15000]}"
+    if check_tool("iptables"):
+        ret, out, _ = run_cmd("iptables -L -n -v --line-numbers", use_sudo=True)
+        if ret == 0:
+            fp = os.path.join(evid_dir, "iptables.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- IPTABLES ---\n{out[:15000]}"
+            hallazgos.append("Reglas iptables recopiladas.")
+    if check_tool("ufw"):
+        ret, out, _ = run_cmd("ufw status verbose", use_sudo=True)
+        if ret == 0:
+            fp = os.path.join(evid_dir, "ufw.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- UFW ---\n{out}"
+            hallazgos.append("Estado UFW recopilado.")
+    for fpath in ["/etc/hosts.allow", "/etc/hosts.deny"]:
+        if path_exists(fpath):
+            ret, out, _ = run_cmd(f"cat {fpath}")
+            if ret == 0:
+                fp = os.path.join(evid_dir, os.path.basename(fpath) + ".txt")
+                save_file(fp, out)
+                ev_files.append(fp)
+                datos_tecnicos += f"\n--- {fpath} ---\n{out}"
+    cumpl = "Cumple" if len(ev_files) >= 3 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Alta"
+    rec = ("Documentar topologia. Implementar segmentacion y controles de acceso."
+           if cumpl == "Cumple"
+           else "Implementar firewall de host, segmentar red y documentar servicios.")
+    return generate_iso_report(
+        next_report_id("NET"), "A.13.1.1, A.13.1.2", "Controles de red",
+        "Revision de configuracion de red, firewall y servicios expuestos.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.13.1.1", "ISO/IEC 27002:2022 8.20"]
+    )
+
+
+def linux_audit_framework():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "05_auditoria"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Framework auditoria (A.12.4)...", C.C))
+    if check_tool("auditctl"):
+        ret, out, _ = run_cmd("auditctl -l", use_sudo=True)
+        if ret == 0:
+            fp = os.path.join(evid_dir, "auditctl.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- AUDITCTL ---\n{out[:15000]}"
+            hallazgos.append("Reglas de auditoria activas recopiladas.")
+    if check_tool("aureport"):
+        for opt, label in [
+            ("--login --summary -i", "login"),
+            ("--user -i --summary", "user"),
+            ("--file -i --summary", "file")
+        ]:
+            ret, out, _ = run_cmd(f"aureport {opt}", use_sudo=True, timeout=120)
+            if ret == 0:
+                fp = os.path.join(evid_dir, f"aureport_{label}.txt")
+                save_file(fp, out)
+                ev_files.append(fp)
+                datos_tecnicos += f"\n--- AUREPORT {label.upper()} ---\n{out[:15000]}"
+                hallazgos.append(f"Aureport {label} generado.")
+    if check_tool("ausearch"):
+        ret, out, _ = run_cmd("ausearch -m USER_LOGIN -ts recent", use_sudo=True, timeout=120)
+        if ret == 0:
+            fp = os.path.join(evid_dir, "ausearch.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- AUSEARCH ---\n{out[:15000]}"
+            hallazgos.append("Busqueda USER_LOGIN realizada.")
+    if path_exists("/var/log/audit"):
+        ret, out, _ = run_cmd("ls -la /var/log/audit/", use_sudo=True)
+        if ret == 0:
+            datos_tecnicos += f"\n--- AUDIT DIR ---\n{out}"
+            hallazgos.append("Directorio audit verificado.")
+    cumpl = "Cumple" if len(ev_files) >= 2 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Alta"
+    rec = ("Mantener audit activo. Revisar reglas y proteger logs."
+           if cumpl == "Cumple"
+           else "Implementar Linux Audit Framework. Monitorear archivos criticos.")
+    return generate_iso_report(
+        next_report_id("AUD"), "A.12.4.1, A.12.4.2", "Framework de auditoria",
+        "Evaluacion del framework de auditoria y proteccion de registros.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.12.4.1", "ISO/IEC 27002:2022 8.15"]
+    )
+
+
+def linux_processes_services():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "06_procesos"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Procesos y servicios (A.12.4 / A.8.1)...", C.C))
+    if check_tool("ps"):
+        ret, out, _ = run_cmd("ps auxww")
+        if ret == 0:
+            fp = os.path.join(evid_dir, "ps_aux.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- PS AUX ---\n{out[:20000]}"
+            hallazgos.append("Procesos activos recopilados.")
+    if check_tool("systemctl"):
+        ret, out, _ = run_cmd("systemctl list-units --type=service --state=running")
+        if ret == 0:
+            fp = os.path.join(evid_dir, "systemctl_running.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- SYSTEMCTL RUNNING ---\n{out[:15000]}"
+            hallazgos.append("Servicios en ejecucion listados.")
+        ret, out, _ = run_cmd("systemctl list-unit-files --state=enabled")
+        if ret == 0:
+            fp = os.path.join(evid_dir, "systemctl_enabled.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- SYSTEMCTL ENABLED ---\n{out[:10000]}"
+    if check_tool("lsof"):
+        ret, out, _ = run_cmd("lsof -nP | head -500", use_sudo=True, timeout=60)
+        if ret == 0:
+            fp = os.path.join(evid_dir, "lsof.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- LSOF ---\n{out[:20000]}"
+            hallazgos.append("Archivos abiertos recopilados.")
+    ret, out, _ = run_cmd("cat /etc/crontab", use_sudo=True)
+    if ret == 0:
+        fp = os.path.join(evid_dir, "crontab.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- CRONTAB ---\n{out}"
+        hallazgos.append("Crontab recopilado.")
+    if path_exists("/etc/cron.d"):
+        ret, out, _ = run_cmd("ls -la /etc/cron.d/ && cat /etc/cron.d/* 2>/dev/null", use_sudo=True)
+        if ret == 0:
+            fp = os.path.join(evid_dir, "cron_d.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- CRON.D ---\n{out[:10000]}"
+    ret, out, _ = run_cmd("atq", use_sudo=True)
+    if ret == 0 and out.strip():
+        fp = os.path.join(evid_dir, "atq.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- ATQ ---\n{out}"
+        hallazgos.append("Tareas at detectadas.")
+    cumpl = "Cumple" if len(ev_files) >= 3 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Media"
+    rec = ("Mantener inventario de servicios. Deshabilitar innecesarios."
+           if cumpl == "Cumple"
+           else "Documentar servicios. Implementar hardening y minimizacion.")
+    return generate_iso_report(
+        next_report_id("PROC"), "A.12.4.1, A.8.1.2", "Procesos y servicios",
+        "Revision de procesos activos, servicios y tareas programadas.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.12.4.1", "ISO/IEC 27002:2022 8.8"]
+    )
+
+
+def linux_filesystem():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "07_filesystem"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Filesystem (A.8.1)...", C.C))
+    ret, out, _ = run_cmd("cat /proc/mounts", use_sudo=True)
+    if ret == 0:
+        fp = os.path.join(evid_dir, "mounts.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- MOUNTS ---\n{out[:10000]}"
+        hallazgos.append("Mounts recopilados.")
+    if path_exists("/etc/fstab"):
+        ret, out, _ = run_cmd("cat /etc/fstab")
+        if ret == 0:
+            fp = os.path.join(evid_dir, "fstab.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- FSTAB ---\n{out}"
+    ret, out, _ = run_cmd("lsblk -f")
+    if ret == 0:
+        fp = os.path.join(evid_dir, "lsblk.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- LSBLK ---\n{out}"
+    ret, out, _ = run_cmd("find / -perm -4000 -type f 2>/dev/null", use_sudo=True, timeout=120)
+    if ret == 0:
+        fp = os.path.join(evid_dir, "suid.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- SUID ---\n{out[:10000]}"
+        suid_count = len([l for l in out.strip().split("\n") if l.strip()])
+        hallazgos.append(f"SUID: {suid_count} archivos.")
+    ret, out, _ = run_cmd("find / -perm -2000 -type f 2>/dev/null", use_sudo=True, timeout=120)
+    if ret == 0:
+        fp = os.path.join(evid_dir, "sgid.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- SGID ---\n{out[:5000]}"
+    ret, out, _ = run_cmd("find / -xdev -type d -perm -0002 2>/dev/null", use_sudo=True, timeout=120)
+    if ret == 0:
+        fp = os.path.join(evid_dir, "world_writable.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- WORLD WRITABLE ---\n{out[:10000]}"
+        hallazgos.append("World-writable dirs identificados.")
+    ret, out, _ = run_cmd(r"find / -xdev \( -nouser -o -nogroup \) 2>/dev/null", use_sudo=True, timeout=120)
+    if ret == 0:
+        fp = os.path.join(evid_dir, "orphan.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- ORPHAN ---\n{out[:5000]}"
+        if out.strip():
+            hallazgos.append("Archivos sin propietario detectados.")
+    cumpl = "Cumple" if len(ev_files) >= 4 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Media"
+    rec = ("Revisar permisos especiales. Mantener minimo privilegio."
+           if cumpl == "Cumple"
+           else "Implementar hardening de permisos. Eliminar SUID/SGID innecesarios.")
+    return generate_iso_report(
+        next_report_id("FS"), "A.8.1.2, A.8.3.2", "Sistema de archivos",
+        "Revision de filesystem, permisos especiales y propiedad de activos.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.8.1.2", "ISO/IEC 27002:2022 5.9"]
+    )
+
+
+def linux_packages():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "08_software"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Software (A.8.1 / A.8.8)...", C.C))
+    if check_tool("dpkg"):
+        ret, out, _ = run_cmd("dpkg -l")
+        if ret == 0:
+            fp = os.path.join(evid_dir, "dpkg.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- DPKG ---\n{out[:20000]}"
+            hallazgos.append("Paquetes Debian recopilados.")
+    ret, out, _ = run_cmd("uname -a")
+    if ret == 0:
+        datos_tecnicos += f"\n--- KERNEL ---\n{out}"
+        hallazgos.append(f"Kernel: {out.strip()}.")
+    ret, out, _ = run_cmd("lsb_release -a")
+    if ret == 0:
+        datos_tecnicos += f"\n--- OS ---\n{out}"
+    ret, out, _ = run_cmd("env")
+    if ret == 0:
+        fp = os.path.join(evid_dir, "env.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- ENV ---\n{out[:5000]}"
+    cumpl = "Cumple" if len(ev_files) >= 2 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Media"
+    rec = ("Mantener inventario. Aplicar parches periodicamente."
+           if cumpl == "Cumple"
+           else "Implementar gestion de parches e inventario de software autorizado.")
+    return generate_iso_report(
+        next_report_id("SW"), "A.8.1.1, A.8.8", "Software y parches",
+        "Inventario de software y version del sistema operativo.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.8.1.1", "ISO/IEC 27002:2022 8.8"]
+    )
+# =============================================================================
+# WINDOWS TESTS
+# =============================================================================
+def win_event_logs():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "01_eventos"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Eventos Windows (A.12.4.1)...", C.C))
+    channels = ["Security", "System", "Application", "Setup", "ForwardedEvents",
+                "Microsoft-Windows-PowerShell/Operational"]
+    for ch in channels:
+        ps = (f'Get-WinEvent -LogName "{ch}" -MaxEvents 2000 '
+              f'-ErrorAction SilentlyContinue | Format-List *')
+        ret, out, _ = run_cmd(f'powershell -Command "{ps}"', timeout=120)
+        if ret == 0 and out.strip():
+            safe_ch = ch.replace("/", "_")
+            fp = os.path.join(evid_dir, f"{safe_ch}.txt")
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- {ch} ---\n{out[:30000]}"
+            hallazgos.append(f"Canal {ch} recopilado.")
+    ret, out, _ = run_cmd('wevtutil el')
+    if ret == 0:
+        fp = os.path.join(evid_dir, "channels.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- CHANNELS ---\n{out[:10000]}"
+        hallazgos.append("Canales de eventos listados.")
+    cumpl = "Cumple" if len(ev_files) >= 3 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Media"
+    rec = ("Mantener retencion de logs. Verificar integridad."
+           if cumpl == "Cumple"
+           else "Configurar retencion minima 12 meses. Centralizar en SIEM.")
+    return generate_iso_report(
+        next_report_id("EVT"), "A.12.4.1", "Registros de eventos Windows",
+        "Verificacion de logs de eventos de Windows.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.12.4.1", "ISO/IEC 27002:2022 8.15"]
+    )
+
+
+def win_security():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "02_seguridad"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Seguridad Windows (A.9.4)...", C.C))
+    ps_cmds = [
+        ('Get-LocalUser | Select-Object * | Format-List', "users.txt", "Usuarios locales"),
+        ('Get-LocalGroup | Select-Object * | Format-List', "groups.txt", "Grupos locales"),
+        ('Get-LocalGroupMember -Group "Administrators" | Format-List', "admins.txt", "Grupo Administrators"),
+    ]
+    for ps, fname, label in ps_cmds:
+        ret, out, _ = run_cmd(f'powershell -Command "{ps}"')
+        if ret == 0:
+            fp = os.path.join(evid_dir, fname)
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- {label.upper()} ---\n{out[:15000]}"
+            hallazgos.append(f"{label} recopilado.")
+    ret, out, _ = run_cmd('net accounts')
+    if ret == 0:
+        fp = os.path.join(evid_dir, "password_policy.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- PASSWORD POLICY ---\n{out}"
+        hallazgos.append("Politica de contrasenas recopilada.")
+    ret, out, _ = run_cmd('secedit /export /cfg "%TEMP%\\secpol.cfg" && type "%TEMP%\\secpol.cfg"')
+    if ret == 0:
+        fp = os.path.join(evid_dir, "secpol.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- SECPOL ---\n{out[:20000]}"
+        hallazgos.append("Politicas de seguridad exportadas.")
+    cumpl = "Cumple" if len(ev_files) >= 3 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Alta"
+    rec = ("Verificar politicas de contrasena. Revisar membresia de grupos privilegiados."
+           if cumpl == "Cumple"
+           else "Implementar politicas de contrasena robustas. Restringir acceso administrativo.")
+    return generate_iso_report(
+        next_report_id("SEC"), "A.9.4.2, A.9.4.3", "Seguridad de acceso Windows",
+        "Revision de usuarios, grupos y politicas de seguridad.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.9.4.2", "ISO/IEC 27002:2022 5.17"]
+    )
+
+
+def win_network():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "03_red"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Red Windows (A.13.1)...", C.C))
+    for cmd, fname, label in [
+        ('ipconfig /all', "ipconfig.txt", "IPCONFIG"),
+        ('route print', "route.txt", "ROUTE"),
+        ('netstat -anob', "netstat.txt", "NETSTAT"),
+        ('arp -a', "arp.txt", "ARP")
+    ]:
+        ret, out, _ = run_cmd(cmd)
+        if ret == 0:
+            fp = os.path.join(evid_dir, fname)
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- {label} ---\n{out[:20000]}"
+            hallazgos.append(f"{label} recopilado.")
+    ps = ('Get-NetFirewallRule | Where-Object {$_.Enabled -eq "True"} '
+          '| Format-Table -AutoSize')
+    ret, out, _ = run_cmd(f'powershell -Command "{ps}"', timeout=120)
+    if ret == 0:
+        fp = os.path.join(evid_dir, "firewall.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- FIREWALL ---\n{out[:30000]}"
+        hallazgos.append("Reglas de firewall recopiladas.")
+    ret, out, _ = run_cmd('netsh advfirewall show allprofiles')
+    if ret == 0:
+        fp = os.path.join(evid_dir, "firewall_profiles.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- FIREWALL PROFILES ---\n{out}"
+    cumpl = "Cumple" if len(ev_files) >= 3 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Alta"
+    rec = ("Documentar topologia. Segmentar red. Controlar servicios expuestos."
+           if cumpl == "Cumple"
+           else "Implementar firewall de host. Documentar y segmentar la red.")
+    return generate_iso_report(
+        next_report_id("NET"), "A.13.1.1, A.13.1.2", "Controles de red Windows",
+        "Revision de configuracion de red, firewall y servicios.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.13.1.1", "ISO/IEC 27002:2022 8.20"]
+    )
+
+
+def win_services_processes():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "04_servicios"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Servicios y procesos Windows (A.12.4 / A.8.1)...", C.C))
+    ps_cmds = [
+        ('Get-Service | Select-Object * | Format-List', "services.txt", "Servicios"),
+        ('Get-Process | Select-Object * | Format-List', "processes.txt", "Procesos"),
+        ('Get-ScheduledTask | Select-Object TaskName,TaskPath,State,Author '
+         '| Format-Table -AutoSize', "tasks.txt", "Tareas programadas"),
+        ('Get-CimInstance Win32_StartupCommand | Select-Object * | Format-List',
+         "startup.txt", "Startup"),
+    ]
+    for ps, fname, label in ps_cmds:
+        ret, out, _ = run_cmd(f'powershell -Command "{ps}"', timeout=120)
+        if ret == 0:
+            fp = os.path.join(evid_dir, fname)
+            save_file(fp, out)
+            ev_files.append(fp)
+            datos_tecnicos += f"\n--- {label.upper()} ---\n{out[:20000]}"
+            hallazgos.append(f"{label} recopilado.")
+    ret, out, _ = run_cmd('tasklist /v')
+    if ret == 0:
+        fp = os.path.join(evid_dir, "tasklist.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- TASKLIST ---\n{out[:15000]}"
+    cumpl = "Cumple" if len(ev_files) >= 3 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Media"
+    rec = ("Mantener inventario. Deshabilitar servicios innecesarios."
+           if cumpl == "Cumple"
+           else "Documentar servicios. Implementar hardening y minimizacion.")
+    return generate_iso_report(
+        next_report_id("PROC"), "A.12.4.1, A.8.1.2", "Servicios y procesos Windows",
+        "Revision de servicios, procesos y tareas programadas.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.12.4.1", "ISO/IEC 27002:2022 8.8"]
+    )
+
+
+def win_system_info():
+    evid_dir = ensure_dir(os.path.join(audit_data["output_dir"], "evidencias", "05_sistema"))
+    hallazgos, ev_files, datos_tecnicos = [], [], ""
+    print(color("  [*] Info sistema Windows (A.8.1)...", C.C))
+    ret, out, _ = run_cmd('systeminfo')
+    if ret == 0:
+        fp = os.path.join(evid_dir, "systeminfo.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- SYSTEMINFO ---\n{out[:30000]}"
+        hallazgos.append("Informacion del sistema recopilada.")
+    ret, out, _ = run_cmd('set')
+    if ret == 0:
+        fp = os.path.join(evid_dir, "env.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- ENV ---\n{out[:10000]}"
+    ps = ('Get-ItemProperty "HKLM:\\SOFTWARE\\Microsoft\\Windows\\'
+          'CurrentVersion\\Uninstall\\*" | Select-Object '
+          'DisplayName,DisplayVersion,Publisher,InstallDate '
+          '| Format-Table -AutoSize')
+    ret, out, _ = run_cmd(f'powershell -Command "{ps}"', timeout=120)
+    if ret == 0:
+        fp = os.path.join(evid_dir, "software.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- SOFTWARE ---\n{out[:30000]}"
+        hallazgos.append("Software instalado recopilado.")
+    ret, out, _ = run_cmd('net share')
+    if ret == 0:
+        fp = os.path.join(evid_dir, "shares.txt")
+        save_file(fp, out)
+        ev_files.append(fp)
+        datos_tecnicos += f"\n--- SHARES ---\n{out}"
+        hallazgos.append("Recursos compartidos listados.")
+    cumpl = "Cumple" if len(ev_files) >= 3 else "Parcial"
+    sev = "Baja" if cumpl == "Cumple" else "Media"
+    rec = ("Mantener inventario actualizado. Aplicar parches."
+           if cumpl == "Cumple"
+           else "Implementar gestion de parches e inventario de software.")
+    return generate_iso_report(
+        next_report_id("SYS"), "A.8.1.1, A.8.8", "Software y sistema Windows",
+        "Inventario de software y configuracion del sistema.",
+        "\n".join(hallazgos), ev_files, datos_tecnicos, cumpl, sev, rec,
+        ["ISO/IEC 27001:2022 A.8.1.1", "ISO/IEC 27002:2022 8.8"]
+    )
+
+
+# =============================================================================
+# RECOPILAR TODO
+# =============================================================================
+def collect_all():
+    global REPORT_COUNTER
+    REPORT_COUNTER = 0   # Reiniciar contador al inicio de cada recopilación completa
+    is_linux = (REMOTE_OS == "linux") if REMOTE_MODE else (platform.system() != "Windows")
+    all_results = []
+    print(color("\n[*] INICIANDO RECOPILACION COMPLETA...", C.H))
+    if not audit_data["output_dir"]:
+        print(color("[!] Primero ejecute Opcion 1 para configurar datos de auditoria.", C.F))
+        safe_input("Presione ENTER...")
+        return
+    try:
+        if is_linux:
+            tests = [
+                ("Logs de sistema", linux_system_logs),
+                ("Autenticacion", linux_auth_logs),
+                ("Usuarios", linux_user_info),
+                ("Red", linux_network),
+                ("Framework auditoria", linux_audit_framework),
+                ("Procesos y servicios", linux_processes_services),
+                ("Filesystem", linux_filesystem),
+                ("Software", linux_packages),
+            ]
+        else:
+            tests = [
+                ("Eventos Windows", win_event_logs),
+                ("Seguridad Windows", win_security),
+                ("Red Windows", win_network),
+                ("Servicios y procesos", win_services_processes),
+                ("Sistema Windows", win_system_info),
+            ]
+
+        for test_name, test_func in tests:
+            try:
+                print(color(f"\n  [>>] Ejecutando: {test_name}", C.B))
+                result = test_func()
+                if result:
+                    all_results.append(result)
+            except Exception as e:
+                print(color(f"  [!] Error en {test_name}: {e}", C.F))
+
+        summary = f"""
+{'='*80}
+RESUMEN DE AUDITORIA ISO 27001
+{'='*80}
+ID:           {audit_data['id_auditoria']}
+Organizacion: {audit_data['organizacion']}
+Auditor:      {audit_data['auditor']}
+Fecha:        {audit_data['fecha_auditoria']}
+Sistema:      {audit_data['sistema_operativo']}
+Hostname:     {audit_data['hostname']}
+{'='*80}
+Informes generados: {len(all_results)}
+{'='*80}
+"""
+        for r in all_results:
+            if r:
+                summary += f"  - {os.path.basename(r[0])}\n"
+        sum_path = os.path.join(audit_data["output_dir"], "RESUMEN_AUDITORIA.txt")
+        save_file(sum_path, summary)
+
+        evid_zip = os.path.join(audit_data["output_dir"], "export", "evidencias_completas.txt")
+        with open(evid_zip, 'w', encoding='utf-8') as f:
+            f.write(summary + "\n")
+            for root, dirs, files in os.walk(os.path.join(audit_data["output_dir"], "evidencias")):
+                for file in files:
+                    f.write(f"\n--- {file} ---\n")
+                    try:
+                        with open(os.path.join(root, file), 'r', encoding='utf-8', errors='ignore') as ef:
+                            f.write(ef.read()[:5000] + "\n")
+                    except Exception:
+                        pass
+
+        print(color(f"\n[+] COMPLETADO: {len(all_results)} informes", C.G))
+        print(color(f"[+] Directorio: {audit_data['output_dir']}", C.G))
+        print(color(f"[+] Resumen: {sum_path}", C.G))
+    except (EOFError, KeyboardInterrupt):
+        print(CTRL_Z_MSG)
+        return
+
+
+# =============================================================================
+# ANALISIS CON IA
+# =============================================================================
+def analyze_with_ai():
+    print(color("\n[*] GENERANDO PROMPT PARA ANALISIS CON IA...", C.H))
+    if not audit_data["output_dir"]:
+        print(color("[!] Primero ejecute Opcion 1.", C.F))
+        safe_input("Presione ENTER...")
+        return
+
+    informes_dir = os.path.join(audit_data["output_dir"], "informes")
+    if not os.path.exists(informes_dir):
+        print(color("[!] No hay informes generados. Ejecute recopilacion primero.", C.F))
+        safe_input("Presione ENTER...")
+        return
+
+    all_reports = []
+    for f in sorted(os.listdir(informes_dir)):
+        if f.endswith('.json'):
+            try:
+                with open(os.path.join(informes_dir, f), 'r', encoding='utf-8') as jf:
+                    all_reports.append(json.load(jf))
+            except Exception:
+                pass
+
+    if not all_reports:
+        print(color("[!] No se encontraron informes JSON.", C.F))
+        safe_input("Presione ENTER...")
+        return
+
+    prompt = f"""ACTUA COMO AUDITOR ISO 27001 SENIOR. ANALIZA LOS SIGUIENTES INFORMES DE AUDITORIA Y GENERA:
+
+1. RESUMEN EJECUTIVO (max 1 pagina)
+2. MAPA DE RIESGOS por control ISO 27001
+3. NO CONFORMIDADES identificadas con severidad
+4. RECOMENDACIONES PRIORITARIAS con roadmap
+5. PUNTUACION DE MADUREZ (1-5) por dominio
+
+DATOS DE LA AUDITORIA:
+- Organizacion: {audit_data['organizacion']}
+- Alcance: {audit_data['alcance']}
+- Auditor: {audit_data['auditor']}
+- Fecha: {audit_data['fecha_auditoria']}
+- Sistema: {audit_data['sistema_operativo']}
+- IP: {audit_data['ip_objetivo']}
+- Dominio: {audit_data['dominio']}
+
+INFORMES RECOPILADOS ({len(all_reports)}):
+"""
+    for r in all_reports:
+        prompt += f"\n--- {r.get('id_informe','N/A')} | Control: {r.get('control_iso','N/A')} ---\n"
+        prompt += f"Titulo: {r.get('titulo_prueba','N/A')}\n"
+        prompt += f"Cumplimiento: {r.get('nivel_cumplimiento','N/A')}\n"
+        prompt += f"Severidad: {r.get('severidad','N/A')}\n"
+        prompt += f"Hallazgos: {r.get('hallazgos','N/A')[:500]}\n"
+        prompt += f"Recomendaciones: {r.get('recomendaciones','N/A')[:500]}\n"
+
+    prompt += """
+INSTRUCCIONES:
+- Usa lenguaje tecnico pero comprensible para direccion
+- Cita controles ISO 27001:2022 especificos
+- Incluye metricas cuantitativas donde sea posible
+- Formato: Markdown con tablas y listas
+"""
+
+    ai_path = os.path.join(audit_data["output_dir"], "export", "PROMPT_ANALISIS_IA.txt")
+    save_file(ai_path, prompt)
+
+    print(color(f"\n[+] Prompt para IA generado: {ai_path}", C.G))
+    print(color("[*] Copie el contenido de este archivo y peguelo en ChatGPT/Claude/etc.", C.C))
+    print(color("[*] El prompt incluye todos los informes recopilados.", C.C))
+    safe_input("\nPresione ENTER...")
+
+
+# =============================================================================
+# EXPORTAR A PDF
+# =============================================================================
+def export_to_pdf():
+    print(color("\n[*] EXPORTANDO A PDF...", C.H))
+    if not audit_data["output_dir"]:
+        print(color("[!] Primero ejecute Opcion 1.", C.F))
+        safe_input("Presione ENTER...")
+        return
+
+    informes_dir = os.path.join(audit_data["output_dir"], "informes")
+    if not os.path.exists(informes_dir):
+        print(color("[!] No hay informes para exportar.", C.F))
+        safe_input("Presione ENTER...")
+        return
+
+    pdf_success = False
+
+    # Intento 1: WeasyPrint
+    try:
+        from weasyprint import HTML, CSS
+        print(color("[*] Usando WeasyPrint...", C.C))
+
+        html_content = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>Auditoria ISO 27001</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
+h1 {{ color: #1a5276; border-bottom: 3px solid #1a5276; padding-bottom: 10px; }}
+h2 {{ color: #2874a6; margin-top: 30px; border-left: 4px solid #2874a6; padding-left: 10px; }}
+h3 {{ color: #5499c7; }}
+pre {{ background: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 9px; }}
+table {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
+th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 11px; }}
+th {{ background: #1a5276; color: white; }}
+.cumple {{ color: green; font-weight: bold; }}
+.parcial {{ color: orange; font-weight: bold; }}
+.no-cumple {{ color: red; font-weight: bold; }}
+.header {{ background: #1a5276; color: white; padding: 20px; margin: -40px -40px 20px -40px; }}
+.footer {{ margin-top: 40px; font-size: 10px; color: #666; border-top: 1px solid #ccc; padding-top: 10px; }}
+</style></head><body>
+<div class="header">
+<h1>Informe de Auditoria ISO/IEC 27001:2022</h1>
+<p><strong>Organizacion:</strong> {audit_data['organizacion']} | 
+<strong>Auditor:</strong> {audit_data['auditor']} | 
+<strong>Fecha:</strong> {audit_data['fecha_auditoria']}</p>
+<p><strong>ID:</strong> {audit_data['id_auditoria']} | 
+<strong>Sistema:</strong> {audit_data['sistema_operativo']} | 
+<strong>Hostname:</strong> {audit_data['hostname']}</p>
+</div>
+"""
+
+        for f in sorted(os.listdir(informes_dir)):
+            if f.endswith('.json'):
+                try:
+                    with open(os.path.join(informes_dir, f), 'r', encoding='utf-8') as jf:
+                        r = json.load(jf)
+                    cumpl_class = "cumple" if r.get('nivel_cumplimiento') == "Cumple" else (
+                        "parcial" if r.get('nivel_cumplimiento') == "Parcial" else "no-cumple"
+                    )
+                    html_content += f"""
+<h2>{r.get('id_informe','N/A')} - {r.get('titulo_prueba','N/A')}</h2>
+<table>
+<tr><th>Control ISO</th><td>{r.get('control_iso','N/A')}</td></tr>
+<tr><th>Cumplimiento</th><td class="{cumpl_class}">{r.get('nivel_cumplimiento','N/A')}</td></tr>
+<tr><th>Severidad</th><td>{r.get('severidad','N/A')}</td></tr>
+<tr><th>Fecha</th><td>{r.get('fecha_hora','N/A')}</td></tr>
+</table>
+<h3>Descripcion</h3>
+<p>{r.get('descripcion','N/A').replace(chr(10),'<br>')}</p>
+<h3>Hallazgos</h3>
+<pre>{r.get('hallazgos','N/A')}</pre>
+<h3>Recomendaciones</h3>
+<p>{r.get('recomendaciones','N/A').replace(chr(10),'<br>')}</p>
+<h3>Datos Tecnicos (resumen)</h3>
+<pre>{r.get('datos_tecnicos','N/A')[:3000]}...</pre>
+<p><small>Hash: {r.get('hash_integridad','N/A')}</small></p>
+<hr>
+"""
+                except Exception:
+                    pass
+
+        html_content += f"""
+<div class="footer">
+Generado por ISO27001 Auditor v{SCRIPT_VERSION} | 
+Hash de integridad verificado | 
+Confidencial - Solo para uso del auditor autorizado
+</div></body></html>"""
+
+        pdf_path = os.path.join(audit_data["output_dir"], "export", "INFORME_AUDITORIA_ISO27001.pdf")
+        HTML(string=html_content).write_pdf(pdf_path)
+        print(color(f"[+] PDF generado: {pdf_path}", C.G))
+        pdf_success = True
+    except ImportError:
+        pass
+    except Exception as e:
+        print(color(f"[!] Error con WeasyPrint: {e}", C.F))
+
+    # Intento 2: ReportLab
+    if not pdf_success:
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.platypus import (
+                SimpleDocTemplate, Paragraph, Spacer, Preformatted, Table, TableStyle
+            )
+            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.lib import colors
+
+            print(color("[*] Usando ReportLab...", C.C))
+            pdf_path = os.path.join(audit_data["output_dir"], "export", "INFORME_AUDITORIA_ISO27001.pdf")
+            doc = SimpleDocTemplate(pdf_path, pagesize=A4)
+            styles = getSampleStyleSheet()
+            story = []
+
+            story.append(Paragraph("<b>Informe de Auditoria ISO/IEC 27001:2022</b>", styles['Title']))
+            story.append(Paragraph(f"Organizacion: {audit_data['organizacion']}", styles['Normal']))
+            story.append(Paragraph(
+                f"Auditor: {audit_data['auditor']} | Fecha: {audit_data['fecha_auditoria']}",
+                styles['Normal']
+            ))
+            story.append(Spacer(1, 20))
+
+            for f in sorted(os.listdir(informes_dir)):
+                if f.endswith('.json'):
+                    try:
+                        with open(os.path.join(informes_dir, f), 'r', encoding='utf-8') as jf:
+                            r = json.load(jf)
+                        story.append(Paragraph(f"<b>{r.get('id_informe','N/A')}</b>", styles['Heading2']))
+                        story.append(Paragraph(f"Control: {r.get('control_iso','N/A')}", styles['Normal']))
+                        story.append(Paragraph(
+                            f"Cumplimiento: {r.get('nivel_cumplimiento','N/A')} | "
+                            f"Severidad: {r.get('severidad','N/A')}",
+                            styles['Normal']
+                        ))
+                        story.append(Paragraph("Hallazgos:", styles['Heading3']))
+                        story.append(Preformatted(r.get('hallazgos','N/A')[:2000], styles['Code']))
+                        story.append(Paragraph("Recomendaciones:", styles['Heading3']))
+                        story.append(Paragraph(r.get('recomendaciones','N/A')[:2000], styles['Normal']))
+                        story.append(Spacer(1, 15))
+                    except Exception:
+                        pass
+
+            doc.build(story)
+            print(color(f"[+] PDF generado: {pdf_path}", C.G))
+            pdf_success = True
+        except ImportError:
+            pass
+        except Exception as e:
+            print(color(f"[!] Error con ReportLab: {e}", C.F))
+
+    # Fallback: HTML
+    if not pdf_success:
+        print(color("[!] No se encontro libreria PDF. Generando HTML...", C.W))
+        html_path = os.path.join(audit_data["output_dir"], "export", "INFORME_AUDITORIA_ISO27001.html")
+
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Auditoria ISO 27001</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 40px; }}
+h1 {{ color: #1a5276; }}
+h2 {{ color: #2874a6; border-left: 4px solid #2874a6; padding-left: 10px; }}
+pre {{ background: #f4f4f4; padding: 15px; border-radius: 5px; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th, td {{ border: 1px solid #ddd; padding: 8px; }}
+th {{ background: #1a5276; color: white; }}
+</style></head><body>
+<h1>Informe de Auditoria ISO/IEC 27001:2022</h1>
+<p><b>Organizacion:</b> {audit_data['organizacion']} | 
+<b>Auditor:</b> {audit_data['auditor']} | 
+<b>Fecha:</b> {audit_data['fecha_auditoria']}</p>
+"""
+        for f in sorted(os.listdir(informes_dir)):
+            if f.endswith('.json'):
+                try:
+                    with open(os.path.join(informes_dir, f), 'r', encoding='utf-8') as jf:
+                        r = json.load(jf)
+                    html += f"""
+<h2>{r.get('id_informe','N/A')} - {r.get('titulo_prueba','N/A')}</h2>
+<table>
+<tr><th>Control</th><td>{r.get('control_iso','N/A')}</td>
+<th>Cumplimiento</th><td>{r.get('nivel_cumplimiento','N/A')}</td></tr>
+<tr><th>Severidad</th><td>{r.get('severidad','N/A')}</td>
+<th>Fecha</th><td>{r.get('fecha_hora','N/A')}</td></tr>
+</table>
+<h3>Hallazgos</h3><pre>{r.get('hallazgos','N/A')}</pre>
+<h3>Recomendaciones</h3>
+<p>{r.get('recomendaciones','N/A').replace(chr(10),'<br>')}</p>
+<p><small>Hash: {r.get('hash_integridad','N/A')}</small></p>
+<hr>"""
+                except Exception:
+                    pass
+        html += "</body></html>"
+        save_file(html_path, html)
+        print(color(f"[+] HTML generado (abra en navegador e imprima a PDF): {html_path}", C.G))
+        print(color("[*] Instale WeasyPrint (pip install weasyprint) o ReportLab para PDF nativo.", C.C))
+
+    safe_input("\nPresione ENTER...")
+
+
+# =============================================================================
+# MENU PRINCIPAL
+# =============================================================================
+def show_menu():
+    clear()
+    banner()
+    show_audit_info()
+    print(color("--- MENU PRINCIPAL ---", C.H))
+    print("  [1] Configurar datos de auditoria")
+    print("  [2] Recopilar TODAS las evidencias")
+    print("  [3] Logs de Sistema / Eventos")
+    print("  [4] Logs de Autenticacion / Seguridad")
+    print("  [5] Usuarios y Grupos")
+    print("  [6] Red y Firewall")
+    print("  [7] Framework de Auditoria")
+    print("  [8] Procesos y Servicios")
+    print("  [9] Sistema de Archivos / Software")
+    print("  [A] Analizar informes con IA (genera prompt)")
+    print("  [P] Exportar informes a PDF")
+    print("  [S] Salir")
+    print()
+
+
+def main():
+    check_privileges()
+    verify_tools_at_startup()
+
+    while True:
+        try:
+            show_menu()
+            choice = safe_input("Seleccione opcion: ").strip().upper()
+            is_linux = (REMOTE_OS == "linux") if REMOTE_MODE else (platform.system() != "Windows")
+
+            if choice == "1":
+                collect_audit_data()
+            elif choice == "2":
+                collect_all()
+            elif choice == "3":
+                if not audit_data["output_dir"]:
+                    print(color("[!] Opcion 1 primero.", C.F))
+                    safe_input("ENTER...")
+                    continue
+                if is_linux:
+                    linux_system_logs()
+                else:
+                    win_event_logs()
+                safe_input("\nENTER...")
+            elif choice == "4":
+                if not audit_data["output_dir"]:
+                    print(color("[!] Opcion 1 primero.", C.F))
+                    safe_input("ENTER...")
+                    continue
+                if is_linux:
+                    linux_auth_logs()
+                else:
+                    win_security()
+                safe_input("\nENTER...")
+            elif choice == "5":
+                if not audit_data["output_dir"]:
+                    print(color("[!] Opcion 1 primero.", C.F))
+                    safe_input("ENTER...")
+                    continue
+                if is_linux:
+                    linux_user_info()
+                else:
+                    print(color("[!] Usuarios en Windows: use opcion 4 (Seguridad).", C.W))
+                safe_input("ENTER...")
+            elif choice == "6":
+                if not audit_data["output_dir"]:
+                    print(color("[!] Opcion 1 primero.", C.F))
+                    safe_input("ENTER...")
+                    continue
+                if is_linux:
+                    linux_network()
+                else:
+                    win_network()
+                safe_input("\nENTER...")
+            elif choice == "7":
+                if not audit_data["output_dir"]:
+                    print(color("[!] Opcion 1 primero.", C.F))
+                    safe_input("ENTER...")
+                    continue
+                if is_linux:
+                    linux_audit_framework()
+                else:
+                    print(color("[!] Framework audit nativo no disponible en Windows.", C.W))
+                safe_input("ENTER...")
+            elif choice == "8":
+                if not audit_data["output_dir"]:
+                    print(color("[!] Opcion 1 primero.", C.F))
+                    safe_input("ENTER...")
+                    continue
+                if is_linux:
+                    linux_processes_services()
+                else:
+                    win_services_processes()
+                safe_input("\nENTER...")
+            elif choice == "9":
+                if not audit_data["output_dir"]:
+                    print(color("[!] Opcion 1 primero.", C.F))
+                    safe_input("ENTER...")
+                    continue
+                if is_linux:
+                    linux_filesystem()
+                    linux_packages()
+                else:
+                    win_system_info()
+                safe_input("\nENTER...")
+            elif choice == "A":
+                analyze_with_ai()
+            elif choice == "P":
+                export_to_pdf()
+            elif choice == "S":
+                if REMOTE_MODE:
+                    disconnect_remote_target()
+                print(color("\n[+] Saliendo...", C.G))
+                break
+            else:
+                print(color("[!] Opcion invalida", C.F))
+                safe_input("ENTER...")
+        except (EOFError, KeyboardInterrupt):
+            continue
+
+
+if __name__ == "__main__":
+    main()
+    
